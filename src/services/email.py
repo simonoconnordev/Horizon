@@ -10,6 +10,7 @@ import smtplib
 import ssl
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.policy import default
 from email.utils import parseaddr
 from typing import List
 
@@ -28,7 +29,6 @@ logger = logging.getLogger(__name__)
 # The summarizer HTML-escapes untrusted text and then Markdown-escapes it,
 # which turns "&#x27;" into "&\#x27;". These helpers undo that once for email.
 _ESCAPED_ENTITY_RE = re.compile(r"&\\#(x?[0-9A-Fa-f]+);")
-_CODE_SPAN_RE = re.compile(r"(`+)(.+?)\1", re.DOTALL)
 _MARKDOWN_BACKSLASH_RE = re.compile(r"\\([\\`*_{}\[\]()<>#!|+.-])")
 _LIST_ITEM = r"[ \t]*(?:\d+[.)]|[-*+])[ \t]"
 _LIST_AFTER_TEXT_RE = re.compile(rf"(?m)^((?!{_LIST_ITEM}).*\S.*)\n(?={_LIST_ITEM})")
@@ -53,18 +53,30 @@ def _prepare_email_markdown(value: str) -> str:
     again here showed entities such as &#x27; and &quot; in the email.
     """
     value = _ESCAPED_ENTITY_RE.sub(r"&#\1;", value)
-    parts = []
-    last = 0
-    for match in _CODE_SPAN_RE.finditer(value):
-        parts.append(_escape_email_text(value[last : match.start()]))
-        # Markdown escapes code span contents itself, and backslashes are
-        # literal there, so decode fully and let Markdown do the escaping.
-        code = html.unescape(_MARKDOWN_BACKSLASH_RE.sub(r"\1", match.group(2)))
-        parts.append(f"`` {code} ``" if "`" in code else f"`{code}`")
-        last = match.end()
-    parts.append(_escape_email_text(value[last:]))
     # Python-Markdown needs a blank line before a list that follows text.
-    return _LIST_AFTER_TEXT_RE.sub(r"\1\n\n", "".join(parts))
+    return _LIST_AFTER_TEXT_RE.sub(r"\1\n\n", _escape_email_text(value))
+
+
+if markdown is not None:
+    class _EmailCodeInlineProcessor(markdown.inlinepatterns.BacktickInlineProcessor):
+        """Decode summary text only after Markdown identifies a real code span."""
+
+        def handleMatch(self, match, data):
+            element, start, end = super().handleMatch(match, data)
+            if match.group(3):
+                code = html.unescape(
+                    _MARKDOWN_BACKSLASH_RE.sub(r"\1", match.group(3).strip())
+                )
+                element.text = markdown.util.AtomicString(markdown.util.code_escape(code))
+            return element, start, end
+
+
+def _render_email_markdown(value: str) -> str:
+    parser = markdown.Markdown()
+    parser.inlinePatterns.register(
+        _EmailCodeInlineProcessor(markdown.inlinepatterns.BACKTICK_RE), "backtick", 190
+    )
+    return parser.convert(value)
 
 
 class EmailManager:
@@ -98,6 +110,11 @@ class EmailManager:
 
             status, messages = mail.search(None, search_crit)
 
+            # Find both request types before RFC822 fetches mark overlapping matches as seen.
+            unsub_keyword = self.config.unsubscribe_keyword
+            search_crit_unsub = f'(UNSEEN SUBJECT "{unsub_keyword}")'
+            unsub_status, unsub_messages = mail.search(None, search_crit_unsub)
+
             if status == "OK" and messages[0]:
                 email_ids = messages[0].split()
                 subscribers = storage_manager.load_subscribers()
@@ -106,7 +123,7 @@ class EmailManager:
                     _, msg_data = mail.fetch(e_id, "(RFC822)")
                     for response_part in msg_data:
                         if isinstance(response_part, tuple):
-                            msg = email.message_from_bytes(response_part[1])
+                            msg = email.message_from_bytes(response_part[1], policy=default)
 
                             subject = str(msg.get("Subject") or "").strip()
                             if subject.upper() != keyword.upper():
@@ -135,20 +152,15 @@ class EmailManager:
                                     else:
                                         logger.info(f"Already subscribed: {email_addr}")
 
-            unsub_keyword = self.config.unsubscribe_keyword
-            search_crit_unsub = f'(UNSEEN SUBJECT "{unsub_keyword}")'
-
-            status, messages = mail.search(None, search_crit_unsub)
-
-            if status == "OK" and messages[0]:
-                email_ids = messages[0].split()
+            if unsub_status == "OK" and unsub_messages[0]:
+                email_ids = unsub_messages[0].split()
                 subscribers = storage_manager.load_subscribers()
 
                 for e_id in email_ids:
                     _, msg_data = mail.fetch(e_id, "(RFC822)")
                     for response_part in msg_data:
                         if isinstance(response_part, tuple):
-                            msg = email.message_from_bytes(response_part[1])
+                            msg = email.message_from_bytes(response_part[1], policy=default)
 
                             subject = str(msg.get("Subject") or "").strip()
                             if subject.upper() != unsub_keyword.upper():
@@ -209,7 +221,7 @@ class EmailManager:
         cleaned_summary = clean_app_summary_markdown(summary_md)
         safe_summary = _prepare_email_markdown(cleaned_summary)
         html_content = (
-            markdown.markdown(safe_summary)
+            _render_email_markdown(safe_summary)
             if markdown
             else f"<pre>{safe_summary}</pre>"
         )
